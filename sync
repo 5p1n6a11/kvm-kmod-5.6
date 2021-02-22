@@ -1,0 +1,329 @@
+#!/usr/bin/python
+
+import sys, os, glob, os.path, shutil, re
+from optparse import OptionParser
+
+glob = glob.glob
+
+def cmd(c):
+    if os.system(c) != 0:
+        raise Exception('command execution failed: ' + c)
+
+parser = OptionParser(usage = 'usage: %prog [-v VERSION][-l LINUX]')
+parser.add_option('-v', action = 'store', type = 'string', dest = 'version', \
+                  help = 'kvm-kmod release version', default = 'kvm-devel')
+parser.add_option('-l', action = 'store', type = 'string', dest = 'linux', \
+                  help = 'Linux kernel tree to sync from', \
+                  default = 'linux')
+parser.set_defaults()
+(options, args) = parser.parse_args()
+version = options.version
+linux = options.linux
+
+_re_cache = {}
+
+def re_cache(regexp):
+    global _re_cache
+    if regexp not in _re_cache:
+        _re_cache[regexp] = re.compile(regexp)
+    return _re_cache[regexp]
+
+def hack_content(fname, data):
+    compat_apis = str.split(
+        'access_ok'
+        )
+    result = []
+    pr_fmt = ''
+    inside_block_state = {}
+    finish_endif = False
+
+    def sub(regexp, repl, str):
+        return re_cache(regexp).sub(repl, str)
+    def w(line, result = result):
+        result.append(line)
+
+    if fname.endswith('S'):
+        w('#include <linux/version.h>')
+    for line in data.splitlines():
+        def match(regexp):
+            return re_cache(regexp).search(line)
+
+        def get_block_key(start_regexp, end_regexp):
+            key = start_regexp + '\n' + end_regexp
+            if not inside_block_state.has_key(key):
+                inside_block_state[key] = False
+            return key
+
+        def inside_block(start_regexp, end_regexp):
+            key = get_block_key(start_regexp, end_regexp)
+            if inside_block_state[key]:
+                if match(end_regexp):
+                    inside_block_state[key] = False
+            elif match(start_regexp):
+                inside_block_state[key] = True
+                return False
+            return inside_block_state[key]
+
+        def match_block_end(start_regexp, end_regexp):
+            key = get_block_key(start_regexp, end_regexp)
+            if inside_block_state[key]:
+                if match(end_regexp):
+                    inside_block_state[key] = False
+                    return True
+            elif match(start_regexp):
+                inside_block_state[key] = True
+            return False
+
+        orig = line
+        f = line.split()
+        if match(r'^#define pr_fmt'):
+            pr_fmt = sub(r'#define pr_fmt\([^)]*\) ("[^"]*").*', r'\1', line) + ' '
+            line = ''
+        line = sub(r'pr_debug\(([^),]*)', r'pr_debug(' + pr_fmt + r'\1', line)
+        if match(r'MODULE_AUTHOR'):
+            w('MODULE_INFO(version, "%s");' % (version,))
+        if fname == 'kvm_main.c' and inside_block(r'^int kvm_init\(', r'^}'):
+            if match(r'return 0;'):
+                w('\tprintk("loaded kvm module (%s)\\n");\n' % (version,))
+	if match(r'^#define TRACE_INCLUDE_PATH'):
+	    line = '#define TRACE_INCLUDE_PATH x86'
+	if match(r'ms_hyperv\.nested_features & HV_X64_NESTED_GUEST_MAPPING_FLUSH$'):
+	    w(line)
+	    line = '\t    && LINUX_VERSION_CODE >= KERNEL_VERSION(4,21,0)'
+	if match(r'^static void kvm_handle_intel_pt_intr'):
+            w('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,1,0)')
+	if match_block_end(r'^static void kvm_handle_intel_pt_intr', '^}'):
+	    w(line)
+	    line = '#endif'
+	if match(r'handle_intel_pt_intr\s*='):
+            w('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,1,0)')
+	    w(line)
+	    line = '#endif'
+	if match(r'boot_cpu_data.x86_cache_bits'):
+            w('#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,19,0)')
+	    w(line)
+	    w('#else')
+	    w(sub('x86_cache_bits', 'x86_phys_bits', line))
+	    line = '#endif'
+	if match_block_end(r'^static void kvm_mmu_notifier_invalidate_range_end', '^}'):
+	    w(line)
+            w('')
+            w('#if LINUX_VERSION_CODE < KERNEL_VERSION(5,0,0)')
+            w('#if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)')
+            w('static void __kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,')
+            w('                                                      struct mm_struct *mm,')
+            w('                                                      unsigned long start,')
+            w('                                                      unsigned long end) ')
+            w('{')
+            w('        struct mmu_notifier_range r = { mm, start, end, false };')
+            w('        kvm_mmu_notifier_invalidate_range_start(mn, &r);')
+            w('}')
+            w('#else')
+            w('static int __kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,')
+            w('                                                     struct mm_struct *mm,')
+            w('                                                     unsigned long start,')
+            w('                                                     unsigned long end,')
+            w('                                                     bool blockable)')
+            w('{')
+            w('        struct mmu_notifier_range r = { mm, start, end, blockable };')
+            w('        return kvm_mmu_notifier_invalidate_range_start(mn, &r);')
+            w('}')
+            w('#endif')
+            w('#define kvm_mmu_notifier_invalidate_range_start __kvm_mmu_notifier_invalidate_range_start')
+            w('')
+            w('static void __kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,')
+            w('                                                   struct mm_struct *mm,')
+            w('                                                   unsigned long start,')
+            w('                                                   unsigned long end)')
+            w('{')
+            w('        struct mmu_notifier_range r = { mm, start, end, false };')
+            w('        kvm_mmu_notifier_invalidate_range_end(mn, &r);')
+            w('}')
+            w('#define kvm_mmu_notifier_invalidate_range_end __kvm_mmu_notifier_invalidate_range_end')
+            w('#endif')
+            line = ''
+	if match(r'freq->policy->cpus'):
+            w('#if LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0)')
+	    w('        cpu = freq->cpu;');
+	    w('#else')
+	    w(line)
+	    line = '#endif'
+	if match(r'DEFINE_STATIC_KEY_FALSE.vmx_l1d_should_flush'):
+            w('#if LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0)')
+            w('static DEFINE_STATIC_KEY_FALSE(mds_user_clear);')
+	    w('#endif')
+	if match(r'BUILD_BUG_ON_MSG.*INTEL_PMC_MAX_FIXED'):
+            line = sub(r'!=', '>', line)
+	if match(r'BUILD_BUG_ON.*(CPUID_LNX_4|CPUID_7_1_EAX)') or \
+			(inside_block(r'^static .*reverse_cpuid', r'^}') and match('CPUID_7_1_EAX')):
+            w('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,3,0)')
+	    w(line)
+            line = '#endif'
+	if match(r'AVX512_BF16'):
+            # For Linux versions that lack CPUID_7_1_EAX
+            line = sub(r'F\(AVX512_BF16\)', '(1u << 5)', line)
+	if match(r'^SYM_FUNC_START'):
+            w('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,5,0)')
+	    w(line)
+	    w('#else')
+            w(sub(r'^SYM_FUNC_START', 'ENTRY', line))
+	    line = '#endif'
+	if match(r'^SYM_FUNC_END'):
+            w('#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,5,0)')
+	    w(line)
+	    w('#else')
+            w(sub(r'^SYM_FUNC_END', 'ENDPROC', line))
+	    line = '#endif'
+
+        for ident in compat_apis:
+            line = sub(r'\b' + ident + r'\b', 'kvm_' + ident, line)
+
+        w(line)
+
+    data = str.join('', [line + '\n' for line in result])
+    return data
+
+def hack_file(T, fname):
+    fullname = T + '/' + fname
+    data = file(fullname).read()
+    data = hack_content(fname, data)
+    file(fullname, 'w').write(data)
+
+def unifdef(fname):
+    data = file('unifdef.h').read() + file(fname).read()
+    file(fname, 'w').write(data)
+
+hack_files = {
+    'x86': str.split('kvm_main.c mmu/mmu.c x86.c x86.h irq.c irq.h lapic.c'
+                     ' lapic.h i8254.c i8259.c eventfd.c emulate.c async_pf.c cpuid.h'
+                     ' cpuid.c pmu.c pmu_amd.c mmu/paging_tmpl.h mtrr.c mmu/page_track.c'
+		     ' vmx/capabilities.h pmu_amd.c svm.c tss.h trace.h'
+		     ' vmx/evmcs.c vmx/evmcs.h vmx/nested.c vmx/nested.h'
+		     ' vmx/pmu_intel.c vmx/vmcs12.c vmx/vmcs12.h vmx/vmcs.h'
+		     ' vmx/vmcs_shadow_fields.h vmx/vmenter.S vmx/vmx.c vmx/vmx.h'),
+}
+
+def mkdir(dir):
+    if not os.path.exists(dir):
+        os.makedirs(dir)
+
+def cp(src, dst):
+    mkdir(os.path.dirname(dst))
+    file(dst, 'w').write(file(src).read())
+
+def copy_if_changed(src, dst):
+    for dir, subdirs, files in os.walk(src):
+        ndir = dst + '/' + dir[len(src)+1:]
+        mkdir(ndir)
+        for fname in files:
+            old = ndir + '/' + fname
+            new = dir + '/' + fname
+            try:
+                if file(old).read() !=  file(new).read():
+                    raise Exception('different.')
+            except:
+                cp(new, old)
+
+def rmtree(path):
+    if os.path.exists(path):
+        shutil.rmtree(path)
+
+def header_sync(arch):
+    T = 'header'
+    rmtree(T)
+    for file in (glob('%(linux)s/include/linux/kvm*.h' % { 'linux': linux }) +
+                 glob('%(linux)s/include/linux/vfio.h' % { 'linux': linux }) +
+                 glob('%(linux)s/include/linux/hyperv.h' % { 'linux': linux }) +
+                 glob('%(linux)s/include/uapi/linux/hyperv.h' % { 'linux': linux }) +
+                 glob('%(linux)s/include/uapi/linux/kvm*.h' % { 'linux': linux })):
+        out = ('%(T)s/include/linux/%(name)s'
+               % { 'T': T, 'name': os.path.basename(file) })
+        cp(file, out)
+        unifdef(out)
+    for file in (glob('%(linux)s/include/kvm/*.h' % { 'linux': linux })):
+        out = ('%(T)s/include/kvm/%(name)s'
+               % { 'T': T, 'name': os.path.basename(file) })
+        cp(file, out)
+        unifdef(out)
+    for file in glob(('%(linux)s/include/trace/events/kvm*.h'
+                      % { 'linux': linux })):
+        out = ('%(T)s/include/trace/events/%(name)s'
+               % { 'T': T, 'name': os.path.basename(file) })
+        cp(file, out)
+        unifdef(out)
+    arch_headers = (
+        [x
+         for dir in ['%(linux)s/arch/%(arch)s/include/asm/kvm*.h',
+                     '%(linux)s/arch/%(arch)s/include/asm/vmx.h',
+                     '%(linux)s/arch/%(arch)s/include/asm/svm.h',
+                     '%(linux)s/arch/%(arch)s/include/asm/msr-index.h',
+                     '%(linux)s/arch/%(arch)s/include/asm/hyperv-tlfs.h',
+                     '%(linux)s/arch/%(arch)s/include/asm/mshyperv.h',
+                     '%(linux)s/arch/%(arch)s/include/asm/virtext*.h']
+         for x in glob(dir % { 'arch': arch, 'linux': linux })
+         ])
+    for file in arch_headers:
+        out = ('%(T)s/include/asm-%(arch)s/%(name)s'
+               % { 'T': T, 'name': os.path.basename(file), 'arch': arch })
+        cp(file, out)
+        unifdef(out)
+    arch_uapi_headers = (
+        [x
+         for dir in ['%(linux)s/arch/%(arch)s/include/uapi/asm/kvm*.h',
+                     '%(linux)s/arch/%(arch)s/include/uapi/asm/vmx.h',
+                     '%(linux)s/arch/%(arch)s/include/uapi/asm/svm.h']
+         for x in glob(dir % { 'arch': arch, 'linux': linux })
+         ])
+    for file in arch_uapi_headers:
+        out = ('%(T)s/include/uapi/asm-%(arch)s/%(name)s'
+               % { 'T': T, 'name': os.path.basename(file), 'arch': arch })
+        cp(file, out)
+        unifdef(out)
+    generic_headers = (
+        [x
+         for dir in ['%(linux)s/include/asm-generic/mshyperv.h',
+		     '%(linux)s/include/clocksource/hyperv_timer.h']
+         for x in glob(dir % { 'arch': arch, 'linux': linux })
+         ])
+    for file in generic_headers:
+        dir = os.path.basename(os.path.dirname(file))
+        out = ('%(T)s/include/%(dir)s/%(name)s'
+               % { 'T': T, 'name': os.path.basename(file), 'dir': dir })
+        cp(file, out)
+        unifdef(out)
+    hack_file(T, 'include/linux/kvm_host.h')
+    hack_file(T, 'include/asm-%(arch)s/kvm_host.h' % { 'arch': arch })
+    if arch == 'x86':
+        hack_file(T, 'include/asm-x86/kvm_emulate.h')
+    copy_if_changed(T, '.')
+    rmtree(T)
+
+def source_sync(arch):
+    T = 'source'
+    rmtree(T)
+    sourcedirs = { '%(linux)s/arch/%(arch)s/kvm': 'source',
+		    '%(linux)s/arch/%(arch)s/kvm/mmu': 'source/mmu',
+		    '%(linux)s/arch/%(arch)s/kvm/vmx': 'source/vmx',
+		    '%(linux)s/virt/kvm': 'source'}
+    for srcdir, outdir in sourcedirs.items():
+	pattern = (srcdir + '/*.[chS]') % { 'linux': linux, 'arch': arch }
+        sources = [file
+               for file in glob(pattern)
+               if not file.endswith('.mod.c')]
+        for file in sources:
+            out = ('%(outdir)s/%(name)s'
+                   % { 'outdir': outdir, 'name': os.path.basename(file) })
+            cp(file, out)
+
+            if out[-1] == 'c':
+                unifdef(out)
+
+    for i in hack_files[arch]:
+        hack_file(T, i)
+
+    copy_if_changed(T, arch)
+    rmtree(T)
+
+for arch in ['x86']:
+    header_sync(arch)
+    source_sync(arch)
